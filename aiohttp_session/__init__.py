@@ -3,6 +3,7 @@
 __version__ = "2.12.1"
 
 import abc
+import asyncio
 import json
 import time
 from collections.abc import Callable, Iterator, MutableMapping
@@ -130,41 +131,258 @@ class Session(MutableMapping[str, Any]):
 SESSION_KEY = "aiohttp_session"
 STORAGE_KEY = "aiohttp_session_storage"
 
+_SESSION_STATE_KEY = object()
 
-async def get_session(request: web.Request) -> Session:
-    session = request.get(SESSION_KEY)
-    if session is None:
-        storage = request.get(STORAGE_KEY)
-        if storage is None:
-            raise RuntimeError(
-                "Install aiohttp_session middleware " "in your aiohttp.web.Application"
-            )
 
+class _SessionState:
+    """Request-scoped arbitration state for lazy session loading.
+
+    Only one session may be committed for a request at a time.  A load
+    or a ``new_session()`` call in progress is represented by a shared
+    task, so concurrent callers join it instead of starting a second
+    one.  ``generation`` invalidates results produced before a
+    ``new_session()`` call.
+    """
+
+    __slots__ = (
+        "failure",
+        "generation",
+        "load_task",
+        "new_committed",
+        "new_task",
+        "session",
+    )
+
+    def __init__(self, session: Session | None = None) -> None:
+        self.session = session
+        self.load_task: asyncio.Task[None] | None = None
+        self.new_task: asyncio.Task[None] | None = None
+        self.generation = 0
+        # True when this generation's identity came from new_session().
+        self.new_committed = False
+        # An error that made the current generation unusable.  It is
+        # re-raised for later callers rather than falling back to a load
+        # of a superseded identity.
+        self.failure: BaseException | None = None
+
+    def invalidate(self) -> int:
+        """Start a new generation and return its number.
+
+        Pending results and captured failures from older generations
+        must not be committed.
+        """
+        self.generation += 1
+        self.session = None
+        self.new_committed = False
+        self.failure = None
+        return self.generation
+
+
+def _get_state(request: web.Request) -> _SessionState | None:
+    return cast(
+        "_SessionState | None",
+        cast(Any, request)._state.get(_SESSION_STATE_KEY),
+    )
+
+
+def _get_or_create_state(request: web.Request) -> _SessionState:
+    state = _get_state(request)
+    if state is None:
+        state = _SessionState(cast("Session | None", request.get(SESSION_KEY)))
+        cast(Any, request)._state[_SESSION_STATE_KEY] = state
+    return state
+
+
+def _publish_session(request: web.Request, session: Session) -> None:
+    # Do not use ``request[SESSION_KEY] = ...``: aiohttp 3.14+ emits
+    # NotAppKeyWarning for string keys there, and warnings may be errors.
+    cast(Any, request)._state[SESSION_KEY] = session
+
+
+def _forget_session(request: web.Request) -> None:
+    cast(Any, request)._state.pop(SESSION_KEY, None)
+
+
+def _consume_task_result(task: asyncio.Task[None]) -> None:
+    # Mark exceptions as retrieved even if every waiter was cancelled.
+    if not task.cancelled():
+        task.exception()
+
+
+def _abandon_pending(state: _SessionState) -> None:
+    """Cancel lazy work that outlived the handler.
+
+    An unawaited load must not commit after the response is built, nor
+    be saved.  Cancelling is request-local: it never blocks another
+    request or the handler itself.
+    """
+    for task in (state.load_task, state.new_task):
+        if task is not None and not task.done():
+            task.cancel()
+    # A task cancelled before its coroutine started never runs its
+    # ``finally``, so clear the slots here as well.
+    state.load_task = None
+    state.new_task = None
+    state.generation += 1
+
+
+def _get_storage(request: web.Request) -> "AbstractStorage":
+    storage = request.get(STORAGE_KEY)
+    if storage is None:
+        raise RuntimeError(
+            "Install aiohttp_session middleware " "in your aiohttp.web.Application"
+        )
+    return cast("AbstractStorage", storage)
+
+
+async def _load_session(
+    request: web.Request,
+    storage: "AbstractStorage",
+    state: _SessionState,
+    generation: int,
+) -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    try:
         session = await storage.load_session(request)
         if not isinstance(session, Session):
             raise RuntimeError(
                 "Installed {!r} storage should return session instance "
                 "on .load_session() call, got {!r}.".format(storage, session)
             )
-        request[SESSION_KEY] = session
-    return session
+        if state.generation == generation and state.load_task is task:
+            state.session = session
+            _publish_session(request, session)
+    finally:
+        if state.load_task is task:
+            state.load_task = None
+
+
+async def _create_new_session(
+    request: web.Request,
+    storage: "AbstractStorage",
+    state: _SessionState,
+    generation: int,
+) -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    try:
+        session = await storage.new_session()
+        if not isinstance(session, Session):
+            raise RuntimeError(
+                "Installed {!r} storage should return session instance "
+                "on .load_session() call, got {!r}.".format(storage, session)
+            )
+        if state.generation == generation and state.new_task is task:
+            state.session = session
+            state.new_committed = True
+            _publish_session(request, session)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # The old identity was already invalidated.  Remember the error
+        # so a regular get_session() cannot fall back to loading it again.
+        if state.generation == generation and state.new_task is task:
+            state.failure = exc
+        raise
+    finally:
+        if state.new_task is task:
+            state.new_task = None
+
+
+async def get_session(request: web.Request) -> Session:
+    state = _get_or_create_state(request)
+
+    while True:
+        if state.session is not None:
+            return state.session
+
+        # A new identity always wins over a load of the old one.
+        new_task = state.new_task
+        if new_task is not None:
+            if not new_task.done():
+                try:
+                    await asyncio.shield(new_task)
+                except asyncio.CancelledError:
+                    raise
+                continue
+            # A cancelled or abandoned attempt is not joined; retry.
+            state.new_task = None
+
+        if state.failure is not None:
+            raise state.failure
+
+        load_task = state.load_task
+        load_generation = state.generation
+        if load_task is None or load_task.done():
+            # An abandoned task skipped its ``finally``; do not resurrect
+            # its result or exception.
+            storage = _get_storage(request)
+            load_task = asyncio.create_task(
+                _load_session(request, storage, state, load_generation)
+            )
+            load_task.add_done_callback(_consume_task_result)
+            state.load_task = load_task
+
+        # shield() keeps the shared load alive if only this waiter is
+        # cancelled; every other caller still observes the same result.
+        try:
+            await asyncio.shield(load_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if state.generation == load_generation:
+                raise
+            # new_session() superseded this load.  Its outcome is no
+            # longer authoritative; join the new identity instead.
+            continue
 
 
 async def new_session(request: web.Request) -> Session:
-    storage = request.get(STORAGE_KEY)
-    if storage is None:
-        raise RuntimeError(
-            "Install aiohttp_session middleware " "in your aiohttp.web.Application"
-        )
+    state = _get_or_create_state(request)
 
-    session = await storage.new_session()
-    if not isinstance(session, Session):
-        raise RuntimeError(
-            "Installed {!r} storage should return session instance "
-            "on .load_session() call, got {!r}.".format(storage, session)
+    while True:
+        if state.session is not None and state.new_committed:
+            # A new identity from this request is already committed.
+            return state.session
+
+        new_task = state.new_task
+        if new_task is not None:
+            if not new_task.done():
+                # Coalesce concurrent new_session() calls: one new
+                # identity per request until the previous one commits.
+                try:
+                    await asyncio.shield(new_task)
+                except asyncio.CancelledError:
+                    raise
+                continue
+            # A completed attempt is not joined again.  This also avoids
+            # replaying cancellation into an unrelated caller.
+            state.new_task = None
+            if state.session is not None and state.new_committed:
+                return state.session
+
+        # Invalidate the old identity before awaiting the storage.  An
+        # in-flight load of the old session can no longer commit, and a
+        # failed attempt must not be retried implicitly as an old load.
+        storage = _get_storage(request)
+        generation = state.invalidate()
+        _forget_session(request)
+        new_task = asyncio.create_task(
+            _create_new_session(request, storage, state, generation)
         )
-    request[SESSION_KEY] = session
-    return session
+        new_task.add_done_callback(_consume_task_result)
+        state.new_task = new_task
+
+        # shield() keeps the shared new identity alive if only this
+        # caller is cancelled; other new_session() callers still join it.
+        try:
+            await asyncio.shield(new_task)
+        except asyncio.CancelledError:
+            raise
+        if state.session is not None:
+            return state.session
+        continue
 
 
 def session_middleware(storage: "AbstractStorage") -> Middleware:
@@ -173,7 +391,7 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
 
     @web.middleware
     async def factory(request: web.Request, handler: Handler) -> web.StreamResponse:
-        request[STORAGE_KEY] = storage
+        cast(Any, request)._state[STORAGE_KEY] = storage
         raise_response = False
         # TODO aiohttp 4:
         # Remove Union from response, and drop the raise_response variable
@@ -183,14 +401,34 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
         except web.HTTPException as exc:
             response = exc
             raise_response = True
+        except BaseException:
+            # Handler failed or was cancelled: do not leave lazy work
+            # running past the request lifetime.
+            state = _get_state(request)
+            if state is not None:
+                _abandon_pending(state)
+            raise
         if not isinstance(response, (web.StreamResponse, web.HTTPException)):
             raise RuntimeError(f"Expect response, not {type(response)!r}")
         if not isinstance(response, (web.Response, web.HTTPException)):
             # likely got websocket or streaming
+            state = _get_state(request)
+            if state is not None:
+                _abandon_pending(state)
             return response
         if response.prepared:
             raise RuntimeError("Cannot save session data into prepared response")
-        session = request.get(SESSION_KEY)
+        state = _get_state(request)
+        if state is not None:
+            # Only the committed session is saved.  A load that is still
+            # in flight, or one superseded by new_session(), is ignored.
+            _abandon_pending(state)
+            session = state.session
+            if session is None:
+                # Honour a Session stored directly on the request.
+                session = cast("Session | None", request.get(SESSION_KEY))
+        else:
+            session = request.get(SESSION_KEY)
         if session is not None:
             if session._changed:
                 await storage.save_session(request, response, session)

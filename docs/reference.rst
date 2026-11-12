@@ -18,6 +18,12 @@ Public functions
    A :ref:`coroutine<coroutine>` for getting session instance from
    request object.
 
+   The session is loaded lazily and at most once per request.  Callers
+   that run concurrently on the same request (for example two coroutines
+   spawned by a handler) share one in-flight load and receive the same
+   :class:`Session` instance.  Only the session committed for the
+   request is saved by the middleware.
+
    See example below in :ref:`Session<aiohttp-session-session>`
    section for :func:`get_session` usage.
 
@@ -30,6 +36,14 @@ Public functions
 
       Always use :func:`new_session` instead of :func:`get_session`
       in your login views to guard against Session Fixation attacks!
+
+   A call to :func:`new_session` invalidates the session identity for
+   the rest of the request.  If a :func:`get_session` load is still in
+   flight, its result is discarded; concurrent readers join the new
+   session instead.  Concurrent :func:`new_session` calls on the same
+   request coalesce into a single new identity.  If creating the new
+   session fails, later :func:`get_session` calls raise that failure
+   instead of falling back to the superseded session.
 
    Example usage::
 
@@ -49,6 +63,11 @@ Public functions
    *storage* is a session storage instance (object used to store
    session data into cookies, Redis, database etc., class is derived
    from :class:`AbstractStorage`).
+
+   The middleware saves only the session committed for the request.
+   Lazy loads that are still in flight when the handler returns are
+   cancelled and never saved, so a discarded old identity cannot be
+   persisted alongside a newer one.
 
    .. seealso:: :ref:`aiohttp-session-storage`
 
