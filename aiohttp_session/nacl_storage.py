@@ -28,7 +28,9 @@ class NaClCookieStorage(AbstractStorage):
         httponly: bool = True,
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
-        decoder: Callable[[str], Any] = json.loads
+        decoder: Callable[[str], Any] = json.loads,
+        absolute_max_age: int | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -40,12 +42,14 @@ class NaClCookieStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            absolute_max_age=absolute_max_age,
+            clock=clock,
         )
 
         self._secretbox = nacl.secret.SecretBox(secret_key)
 
     def empty_session(self) -> Session:
-        return Session(None, data=None, new=True, max_age=self.max_age)
+        return self._new_session()
 
     async def load_session(self, request: web.Request) -> Session:
         cookie = self.load_cookie(request)
@@ -58,7 +62,7 @@ class NaClCookieStorage(AbstractStorage):
                         cookie.encode("utf-8"), encoder=Base64Encoder
                     ).decode("utf-8")
                 )
-                return Session(None, data=data, new=False, max_age=self.max_age)
+                return self._load_session(None, data)
             except (binascii.Error, nacl.exceptions.CryptoError):
                 log.warning(
                     "Cannot decrypt cookie value, " "create a new fresh session"
@@ -68,8 +72,8 @@ class NaClCookieStorage(AbstractStorage):
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session
     ) -> None:
-        if session.empty:
-            return self.save_cookie(response, "", max_age=session.max_age)
+        if session.empty or self._should_expire(session):
+            return self.save_cookie(response, "")
 
         cookie_data = self._encoder(self._get_session_data(session)).encode("utf-8")
         nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
@@ -78,5 +82,5 @@ class NaClCookieStorage(AbstractStorage):
             self._secretbox.encrypt(cookie_data, nonce, encoder=Base64Encoder).decode(
                 "utf-8"
             ),
-            max_age=session.max_age,
+            max_age=session.cookie_max_age,
         )

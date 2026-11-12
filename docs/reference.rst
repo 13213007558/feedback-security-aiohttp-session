@@ -103,7 +103,31 @@ Session
    .. attribute:: created
 
       Creation UNIX TIMESTAMP, the value returned by :func:`time.time`
-      for very first access to the session object.
+      for very first access to the session object.  It is the origin of
+      the absolute lifetime and never changes on update.
+
+   .. attribute:: last_used
+
+      UNIX TIMESTAMP of the last time the session was changed.  It is
+      the origin of the idle timeout and is refreshed by
+      ``changed()``, item assignment and deletion.
+
+   .. attribute:: absolute_deadline
+
+      UNIX TIMESTAMP at which the session ends regardless of activity,
+      or ``None`` when no absolute limit is configured.  It is persisted
+      in the session payload and is never moved by a save.
+
+   .. attribute:: expired
+
+      ``True`` if the loaded session was already beyond its idle or
+      absolute limit.  Read-only requests still clear such a session
+      from the client and backend.
+
+   .. attribute:: max_age
+
+      Idle timeout in seconds.  Setting it takes effect for the next
+      save; ``None`` disables the idle limit.
 
    .. attribute:: identity
 
@@ -118,8 +142,9 @@ Session
    .. method:: changed()
 
       Call this when you mutate a mutable value in the session
-      namespace. See the note below for details on when, and why
-      you should call this.
+      namespace. It also refreshes the idle timer for the next save.
+      See the note below for details on when, and why you should call
+      this.
 
       .. note::
 
@@ -173,7 +198,8 @@ implement both :meth:`~AbstractStorage.load_session` and
 .. class:: AbstractStorage(cookie_name="AIOHTTP_SESSION", *, \
                            domain=None, max_age=None, path='/', \
                            secure=None, httponly=True, samesite=None, \
-                           encoder=json.dumps, decoder=json.loads)
+                           encoder=json.dumps, decoder=json.loads, \
+                           absolute_max_age=None, clock=None)
 
    Base class for session storage implementations.
 
@@ -184,7 +210,16 @@ implement both :meth:`~AbstractStorage.load_session` and
 
    *domain* -- cookie's domain, :class:`str` or ``None``.
 
-   *max_age* -- cookie's max age, :class:`int` or ``None``.
+   *max_age* -- idle timeout for session data, in seconds, :class:`int`
+   or ``None``.  This is also used as the cookie's max age.
+
+   *absolute_max_age* -- maximum lifetime in seconds counted from the
+   first creation of the session, or ``None`` (default) for no absolute
+   limit.  Updating the session renews ``max_age`` but never this limit.
+
+   *clock* -- callable returning the current UNIX timestamp as a
+   :class:`float`; defaults to :func:`time.time`.  Intended for tests
+   and deterministic deployments.
 
    *path* -- cookie's path, :class:`str` or ``None``.
 
@@ -267,7 +302,9 @@ implement both :meth:`~AbstractStorage.load_session` and
       (:class:`aiohttp.web.StreamResponse` or descendants).
 
       *max_age* is cookie lifetime given from session. Storage default
-      is used if the value is ``None``.
+      is used if the value is ``None``.  Session saves pass the smaller
+      of the idle allowance and the time remaining until the absolute
+      deadline, so the cookie cannot outlive the session.
 
 Simple Storage
 --------------
@@ -287,7 +324,8 @@ To use the storage you should push it into
                                cookie_name="AIOHTTP_SESSION", \
                                domain=None, max_age=None, path='/', \
                                secure=None, httponly=True, samesite=None, \
-                               encoder=json.dumps, decoder=json.loads)
+                               encoder=json.dumps, decoder=json.loads, \
+                               absolute_max_age=None, clock=None)
 
    Create unencrypted cookie storage.
 
@@ -318,7 +356,8 @@ To use the storage you should push it into
                                   cookie_name="AIOHTTP_SESSION", \
                                   domain=None, max_age=None, path='/', \
                                   secure=None, httponly=True, samesite=None, \
-                                  encoder=json.dumps, decoder=json.loads)
+                                  encoder=json.dumps, decoder=json.loads, \
+                               absolute_max_age=None, clock=None)
 
    Create encryted cookies storage.
 
@@ -357,7 +396,8 @@ To use the storage you should push it into
                                   cookie_name="AIOHTTP_SESSION", \
                                   domain=None, max_age=None, path='/', \
                                   secure=None, httponly=True, samesite=None, \
-                                  encoder=json.dumps, decoder=json.loads)
+                                  encoder=json.dumps, decoder=json.loads, \
+                               absolute_max_age=None, clock=None)
 
    Create encryted cookies storage.
 
@@ -394,7 +434,8 @@ To use the storage you need setup it first::
                         domain=None, max_age=None, path='/', \
                         secure=None, httponly=True, samesite=None, \
                         key_factory=lambda: uuid.uuid4().hex, \
-                        encoder=json.dumps, decoder=json.loads)
+                        encoder=json.dumps, decoder=json.loads, \
+                        absolute_max_age=None, clock=None)
 
    Create Redis storage for user session data.
 
@@ -431,7 +472,8 @@ To use the storage you need setup it first::
                             domain=None, max_age=None, path='/', \
                             secure=None, httponly=True, samesite=None, \
                             key_factory=lambda: uuid.uuid4().hex, \
-                            encoder=json.dumps, decoder=json.loads)
+                            encoder=json.dumps, decoder=json.loads, \
+                            absolute_max_age=None, clock=None)
 
    Create Memcached storage for user session data.
 

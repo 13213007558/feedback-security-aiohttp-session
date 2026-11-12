@@ -26,7 +26,9 @@ class EncryptedCookieStorage(AbstractStorage):
         httponly: bool = True,
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
-        decoder: Callable[[str], Any] = json.loads
+        decoder: Callable[[str], Any] = json.loads,
+        absolute_max_age: int | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -38,6 +40,8 @@ class EncryptedCookieStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            absolute_max_age=absolute_max_age,
+            clock=clock,
         )
 
         if isinstance(secret_key, fernet.Fernet):
@@ -50,30 +54,31 @@ class EncryptedCookieStorage(AbstractStorage):
     async def load_session(self, request: web.Request) -> Session:
         cookie = self.load_cookie(request)
         if cookie is None:
-            return Session(None, data=None, new=True, max_age=self.max_age)
+            return self._new_session()
         else:
             try:
+                # The Fernet token TTL alone would expire the whole
+                # cookie on every save, losing the absolute deadline.
+                # Session-level limits are enforced from the payload.
                 data = self._decoder(
-                    self._fernet.decrypt(
-                        cookie.encode("utf-8"), ttl=self.max_age
-                    ).decode("utf-8")
+                    self._fernet.decrypt(cookie.encode("utf-8")).decode("utf-8")
                 )
-                return Session(None, data=data, new=False, max_age=self.max_age)
+                return self._load_session(None, data)
             except InvalidToken:
                 log.warning(
                     "Cannot decrypt cookie value, " "create a new fresh session"
                 )
-                return Session(None, data=None, new=True, max_age=self.max_age)
+                return self._new_session()
 
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session
     ) -> None:
-        if session.empty:
-            return self.save_cookie(response, "", max_age=session.max_age)
+        if session.empty or self._should_expire(session):
+            return self.save_cookie(response, "")
 
         cookie_data = self._encoder(self._get_session_data(session)).encode("utf-8")
         self.save_cookie(
             response,
             self._fernet.encrypt(cookie_data).decode("utf-8"),
-            max_age=session.max_age,
+            max_age=session.cookie_max_age,
         )
