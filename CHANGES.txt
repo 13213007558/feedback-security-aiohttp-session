@@ -1,5 +1,17 @@
 .. towncrier release notes start
 
+Unreleased
+==========
+
+* Add resource limits for inbound session payloads. Storages now accept
+  ``max_blob_size`` (transport bytes, enforced before the decoder runs),
+  ``max_session_depth`` and ``max_session_containers`` (structural
+  complexity measured iteratively on the decoded data). Violations are
+  reported through the new ``on_limit_exceeded`` security policy
+  (``LimitViolation`` / ``LimitKind``); the default policy rejects the
+  request with ``413`` or ``400``. Rejected payloads are discarded and
+  never written back.
+
 2.12.1 (2024-09-25)
 ===================
 

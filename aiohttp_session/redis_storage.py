@@ -5,7 +5,12 @@ from typing import Any
 
 from aiohttp import web
 
-from . import AbstractStorage, Session
+from . import (
+    AbstractStorage,
+    LimitExceededHandler,
+    Session,
+    default_limit_exceeded_handler,
+)
 
 try:
     from redis import VERSION as REDIS_VERSION, asyncio as aioredis
@@ -42,6 +47,10 @@ class RedisStorage(AbstractStorage):
         key_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
         encoder: Callable[[object], str] = json.dumps,
         decoder: Callable[[str], Any] = json.loads,
+        max_blob_size: int | None = None,
+        max_session_depth: int | None = None,
+        max_session_containers: int | None = None,
+        on_limit_exceeded: LimitExceededHandler = default_limit_exceeded_handler,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -53,6 +62,10 @@ class RedisStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            max_blob_size=max_blob_size,
+            max_session_depth=max_session_depth,
+            max_session_containers=max_session_containers,
+            on_limit_exceeded=on_limit_exceeded,
         )
         if aioredis is None:
             raise RuntimeError("Please install redis")
@@ -73,11 +86,22 @@ class RedisStorage(AbstractStorage):
             data_bytes = await self._redis.get(self.cookie_name + "_" + key)
             if data_bytes is None:
                 return Session(None, data=None, new=True, max_age=self.max_age)
+
+            violation = await self._blob_violation(request, data_bytes)
+            if violation is not None:
+                return Session(key, data=None, new=False, max_age=self.max_age)
+
             data_str = data_bytes.decode("utf-8")
             try:
                 data = self._decoder(data_str)
             except ValueError:
-                data = None
+                return Session(key, data=None, new=False, max_age=self.max_age)
+
+            violation = self._check_structure(data)
+            if violation is not None:
+                await self._handle_violation(request, violation)
+                return Session(key, data=None, new=False, max_age=self.max_age)
+
             return Session(key, data=data, new=False, max_age=self.max_age)
 
     async def save_session(

@@ -7,7 +7,12 @@ from typing import Any
 import aiomcache
 from aiohttp import web
 
-from . import AbstractStorage, Session
+from . import (
+    AbstractStorage,
+    LimitExceededHandler,
+    Session,
+    default_limit_exceeded_handler,
+)
 
 
 class MemcachedStorage(AbstractStorage):
@@ -26,7 +31,11 @@ class MemcachedStorage(AbstractStorage):
         samesite: str | None = None,
         key_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
         encoder: Callable[[object], str] = json.dumps,
-        decoder: Callable[[str], Any] = json.loads
+        decoder: Callable[[str], Any] = json.loads,
+        max_blob_size: int | None = None,
+        max_session_depth: int | None = None,
+        max_session_containers: int | None = None,
+        on_limit_exceeded: LimitExceededHandler = default_limit_exceeded_handler,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -38,6 +47,10 @@ class MemcachedStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            max_blob_size=max_blob_size,
+            max_session_depth=max_session_depth,
+            max_session_containers=max_session_containers,
+            on_limit_exceeded=on_limit_exceeded,
         )
         self._key_factory = key_factory
         self.conn = memcached_conn
@@ -52,11 +65,22 @@ class MemcachedStorage(AbstractStorage):
             data_b = await self.conn.get(stored_key)
             if data_b is None:
                 return Session(None, data=None, new=True, max_age=self.max_age)
+
+            violation = await self._blob_violation(request, data_b)
+            if violation is not None:
+                return Session(key, data=None, new=False, max_age=self.max_age)
+
             data = data_b.decode("utf-8")
             try:
                 sess_data = self._decoder(data)
             except ValueError:
-                sess_data = None
+                return Session(key, data=None, new=False, max_age=self.max_age)
+
+            violation = self._check_structure(sess_data)
+            if violation is not None:
+                await self._handle_violation(request, violation)
+                return Session(key, data=None, new=False, max_age=self.max_age)
+
             return Session(key, data=sess_data, new=False, max_age=self.max_age)
 
     async def save_session(

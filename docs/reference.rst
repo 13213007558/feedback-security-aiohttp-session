@@ -39,7 +39,7 @@ Public functions
           session = await new_session(request)
           session.new == True # This will always be True
 
-.. function:: session_middleware(storage)
+.. function:: session_middleware(storage, on_limit_exceeded=None)
 
    Session middleware factory.
 
@@ -50,17 +50,21 @@ Public functions
    session data into cookies, Redis, database etc., class is derived
    from :class:`AbstractStorage`).
 
+   *on_limit_exceeded* optionally overrides the storage's security
+   policy for resource-limit violations. See :class:`AbstractStorage`
+   for the semantics of the callback.
+
    .. seealso:: :ref:`aiohttp-session-storage`
 
    .. note:: :func:`setup` is new-fashion way for library setup.
 
-.. function:: setup(app, storage)
+.. function:: setup(app, storage, on_limit_exceeded=None)
 
    Setup session support for given *app*.
 
    The function is shortcut for::
 
-      app.middlewares.append(session_middleware(storage))
+      app.middlewares.append(session_middleware(storage, on_limit_exceeded))
 
    *app* is :class:`aiohttp.web.Application` instance.
 
@@ -68,7 +72,40 @@ Public functions
    session data into cookies, Redis, database etc., class is derived
    from :class:`AbstractStorage`).
 
+   *on_limit_exceeded* optionally overrides the storage's security
+   policy for resource-limit violations.
+
    .. seealso:: :ref:`aiohttp-session-storage`
+
+
+Resource limits
+===============
+
+.. class:: LimitKind
+
+   Enumeration of the resource limits a storage can enforce. Members:
+
+   * ``LimitKind.BYTES`` -- the raw transport payload exceeded
+     *max_blob_size*.
+   * ``LimitKind.DEPTH`` -- the decoded payload nesting exceeded
+     *max_session_depth*.
+   * ``LimitKind.CONTAINERS`` -- the decoded payload container count
+     exceeded *max_session_containers*.
+
+.. class:: LimitViolation
+
+   Frozen description of a rejected payload with the attributes
+   *kind* (a :class:`LimitKind`), *limit* (the configured ceiling) and
+   *observed* (the measured value). Instances are passed to the
+   *on_limit_exceeded* security policy.
+
+.. function:: default_limit_exceeded_handler(request, storage, violation)
+
+   Default security policy. It logs the rejection and raises
+   :class:`aiohttp.web.HTTPRequestEntityTooLarge` (``413``) for byte
+   violations or :class:`aiohttp.web.HTTPBadRequest` (``400``) for
+   structural violations. The offending payload has already been
+   discarded by the storage and is never persisted.
 
 
 .. _aiohttp-session-session:
@@ -173,7 +210,10 @@ implement both :meth:`~AbstractStorage.load_session` and
 .. class:: AbstractStorage(cookie_name="AIOHTTP_SESSION", *, \
                            domain=None, max_age=None, path='/', \
                            secure=None, httponly=True, samesite=None, \
-                           encoder=json.dumps, decoder=json.loads)
+                           encoder=json.dumps, decoder=json.loads, \
+                           max_blob_size=None, max_session_depth=None, \
+                           max_session_containers=None, \
+                           on_limit_exceeded=default_limit_exceeded_handler)
 
    Base class for session storage implementations.
 
@@ -204,6 +244,32 @@ implement both :meth:`~AbstractStorage.load_session` and
    signature: `def decode(param: str) -> Any: ...`.  Default is
    :func:`json.loads`.
 
+   *max_blob_size* -- maximum accepted size of the raw, still encoded
+   session payload measured in transport bytes, :class:`int` or ``None``
+   for no limit. The byte budget is enforced before the decoder runs, so
+   an oversized payload never reaches JSON decoding (or decryption for
+   the encrypted backends).
+
+   *max_session_depth* -- maximum accepted nesting depth of the decoded
+   session data, :class:`int` or ``None`` for no limit.
+
+   *max_session_containers* -- maximum accepted total number of
+   ``dict``/``list``/``tuple`` containers in the decoded session data,
+   :class:`int` or ``None`` for no limit. Depth and container count are
+   measured iteratively, so a hostile payload cannot exhaust the Python
+   recursion limit.
+
+   *on_limit_exceeded* -- awaitable security policy called when a payload
+   breaches one of the resource limits. It receives the
+   :class:`aiohttp.web.Request`, the storage and a
+   :class:`LimitViolation` describing the breached :class:`LimitKind`,
+   the configured limit and the observed value. The default policy
+   :func:`default_limit_exceeded_handler` logs the rejection and raises
+   ``413`` for byte-limit violations or ``400`` for structural ones. A
+   custom policy may instead return without raising to continue with a
+   fresh empty session. The rejected payload is always discarded and is
+   never written back.
+
    .. versionadded:: 2.3
 
       Added *encoder* and *decoder* parameters.
@@ -221,6 +287,24 @@ implement both :meth:`~AbstractStorage.load_session` and
 
       :class:`dict` of cookie params: *domain*, *max_age*, *path*,
       *secure*, *httponly* and *samesite*.
+
+   .. attribute:: max_blob_size
+
+      The configured transport byte budget, or ``None``.
+
+   .. attribute:: max_session_depth
+
+      The configured maximum nesting depth, or ``None``.
+
+   .. attribute:: max_session_containers
+
+      The configured maximum container count, or ``None``.
+
+   .. attribute:: on_limit_exceeded
+
+      The active security policy invoked on a resource-limit violation.
+      It can be overridden per middleware via the *on_limit_exceeded*
+      argument of :func:`session_middleware` or :func:`setup`.
 
    .. attribute:: encoder
 

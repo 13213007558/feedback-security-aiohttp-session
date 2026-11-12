@@ -3,13 +3,102 @@
 __version__ = "2.12.1"
 
 import abc
+import enum
 import json
 import time
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, MutableMapping
+from dataclasses import dataclass
 from typing import Any, TypedDict, cast
 
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
+
+from .log import log
+
+
+class LimitKind(str, enum.Enum):
+    """Kind of resource limit that was exceeded while loading a session."""
+
+    BYTES = "bytes"
+    DEPTH = "depth"
+    CONTAINERS = "containers"
+
+
+@dataclass(frozen=True)
+class LimitViolation:
+    """Details of a rejected session payload.
+
+    *kind* identifies the breached limit, *limit* the configured ceiling
+    and *observed* the actual measured value.
+    """
+
+    kind: LimitKind
+    limit: int
+    observed: int
+
+
+# A security policy invoked by the middleware when a storage rejects a
+# session payload because it exceeds a configured resource limit.
+LimitExceededHandler = Callable[
+    [web.Request, "AbstractStorage", LimitViolation], Awaitable[None]
+]
+
+
+async def default_limit_exceeded_handler(
+    request: web.Request,
+    storage: "AbstractStorage",
+    violation: LimitViolation,
+) -> None:
+    """Default security policy: log the rejection and refuse the request.
+
+    The offending payload has already been discarded by the storage, so no
+    untrusted data is ever persisted. Byte budget violations are reported as
+    ``413 Payload Too Large``, structural violations as ``400 Bad Request``.
+    """
+    log.warning(
+        "Rejected session cookie %r: %s limit %s exceeded (observed %s)",
+        storage.cookie_name,
+        violation.kind.value,
+        violation.limit,
+        violation.observed,
+    )
+    if violation.kind is LimitKind.BYTES:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=violation.limit, actual_size=violation.observed
+        )
+    raise web.HTTPBadRequest(
+        reason=(
+            f"Session {violation.kind.value} limit {violation.limit} "
+            f"exceeded (observed {violation.observed})"
+        )
+    )
+
+
+def measure_json_complexity(value: Any) -> tuple[int, int]:
+    """Measure decoded data complexity without recursion.
+
+    Returns a ``(depth, container_count)`` tuple. *depth* counts the nesting
+    levels (scalars have depth 1, an empty container has depth 1 as well) and
+    *container_count* is the total number of ``dict``/``list``/``tuple``
+    containers encountered. The traversal is iterative so a deeply nested or
+    hostile payload cannot exhaust the Python recursion limit.
+    """
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    max_depth = 0
+    container_count = 0
+    while stack:
+        current, depth = stack.pop()
+        if depth > max_depth:
+            max_depth = depth
+        if isinstance(current, (dict, list, tuple)):
+            container_count += 1
+            if isinstance(current, dict):
+                children: Iterable[Any] = current.values()
+            else:
+                children = current
+            for child in children:
+                stack.append((child, depth + 1))
+    return max_depth, container_count
 
 
 class _CookieParams(TypedDict, total=False):
@@ -167,9 +256,15 @@ async def new_session(request: web.Request) -> Session:
     return session
 
 
-def session_middleware(storage: "AbstractStorage") -> Middleware:
+def session_middleware(
+    storage: "AbstractStorage",
+    on_limit_exceeded: LimitExceededHandler | None = None,
+) -> Middleware:
     if not isinstance(storage, AbstractStorage):
         raise RuntimeError(f"Expected AbstractStorage got {storage}")
+
+    if on_limit_exceeded is not None:
+        storage.on_limit_exceeded = on_limit_exceeded
 
     @web.middleware
     async def factory(request: web.Request, handler: Handler) -> web.StreamResponse:
@@ -201,10 +296,14 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
     return factory
 
 
-def setup(app: web.Application, storage: "AbstractStorage") -> None:
+def setup(
+    app: web.Application,
+    storage: "AbstractStorage",
+    on_limit_exceeded: LimitExceededHandler | None = None,
+) -> None:
     """Setup the library in aiohttp fashion."""
 
-    app.middlewares.append(session_middleware(storage))
+    app.middlewares.append(session_middleware(storage, on_limit_exceeded))
 
 
 class AbstractStorage(metaclass=abc.ABCMeta):
@@ -220,6 +319,10 @@ class AbstractStorage(metaclass=abc.ABCMeta):
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
         decoder: Callable[[str], Any] = json.loads,
+        max_blob_size: int | None = None,
+        max_session_depth: int | None = None,
+        max_session_containers: int | None = None,
+        on_limit_exceeded: LimitExceededHandler = default_limit_exceeded_handler,
     ) -> None:
         self._cookie_name = cookie_name
         self._cookie_params = _CookieParams(
@@ -233,6 +336,17 @@ class AbstractStorage(metaclass=abc.ABCMeta):
         self._max_age = max_age
         self._encoder = encoder
         self._decoder = decoder
+        for name, value in (
+            ("max_blob_size", max_blob_size),
+            ("max_session_depth", max_session_depth),
+            ("max_session_containers", max_session_containers),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be a positive integer or None")
+        self._max_blob_size = max_blob_size
+        self._max_session_depth = max_session_depth
+        self._max_session_containers = max_session_containers
+        self.on_limit_exceeded = on_limit_exceeded
 
     @property
     def cookie_name(self) -> str:
@@ -245,6 +359,120 @@ class AbstractStorage(metaclass=abc.ABCMeta):
     @property
     def cookie_params(self) -> _CookieParams:
         return self._cookie_params
+
+    @property
+    def max_blob_size(self) -> int | None:
+        return self._max_blob_size
+
+    @property
+    def max_session_depth(self) -> int | None:
+        return self._max_session_depth
+
+    @property
+    def max_session_containers(self) -> int | None:
+        return self._max_session_containers
+
+    def _check_blob_size(self, blob: str | bytes) -> LimitViolation | None:
+        """Reject the raw, still-encoded payload before any decoding."""
+        if self._max_blob_size is None:
+            return None
+        observed = len(blob.encode("utf-8")) if isinstance(blob, str) else len(blob)
+        if observed > self._max_blob_size:
+            return LimitViolation(
+                LimitKind.BYTES, self._max_blob_size, observed
+            )
+        return None
+
+    def _check_structure(self, data: Any) -> LimitViolation | None:
+        """Reject decoded payloads that are too deeply nested or too wide."""
+        depth, container_count = measure_json_complexity(data)
+        if (
+            self._max_session_depth is not None
+            and depth > self._max_session_depth
+        ):
+            return LimitViolation(
+                LimitKind.DEPTH, self._max_session_depth, depth
+            )
+        if (
+            self._max_session_containers is not None
+            and container_count > self._max_session_containers
+        ):
+            return LimitViolation(
+                LimitKind.CONTAINERS,
+                self._max_session_containers,
+                container_count,
+            )
+        return None
+
+    async def _handle_violation(
+        self,
+        request: web.Request,
+        violation: LimitViolation,
+    ) -> None:
+        await self.on_limit_exceeded(request, self, violation)
+
+    async def _reject_oversized_blob(
+        self, request: web.Request, blob: str | bytes
+    ) -> Session | None:
+        """Enforce the byte budget on the raw transport representation.
+
+        Returns a fresh empty session when the blob is rejected, otherwise
+        ``None``. An oversized blob never reaches the decoder.
+        """
+        violation = self._check_blob_size(blob)
+        if violation is None:
+            return None
+        await self._handle_violation(request, violation)
+        return await self.new_session()
+
+    async def _blob_violation(
+        self, request: web.Request, blob: str | bytes
+    ) -> LimitViolation | None:
+        """Return the byte-budget violation for *blob*, running the policy.
+
+        Like :meth:`_reject_oversized_blob` but without constructing a
+        session, so key-based backends (Redis/Memcached) can preserve their
+        own identity semantics.
+        """
+        violation = self._check_blob_size(blob)
+        if violation is None:
+            return None
+        await self._handle_violation(request, violation)
+        return violation
+
+    async def _decode_session_text(self, request: web.Request, blob: str) -> Session:
+        """Decode JSON text and enforce the structural complexity limits."""
+        try:
+            data = self._decoder(blob)
+        except ValueError:
+            return await self.new_session()
+
+        violation = self._check_structure(data)
+        if violation is not None:
+            await self._handle_violation(request, violation)
+            return await self.new_session()
+
+        return Session(None, data=data, new=False, max_age=self.max_age)
+
+    async def _load_decoded_session(
+        self, request: web.Request, blob: str | bytes
+    ) -> Session:
+        """Load a plaintext JSON payload, enforcing every resource limit.
+
+        The byte budget is checked on the raw transport representation first,
+        so an oversized blob never reaches the decoder. Structural limits are
+        measured on the decoded value. On any violation the payload is
+        discarded and the configured security policy runs; this method then
+        returns a fresh empty session so rejected data can never be saved
+        back.
+        """
+        rejected = await self._reject_oversized_blob(request, blob)
+        if rejected is not None:
+            return rejected
+
+        if isinstance(blob, bytes):
+            blob = blob.decode("utf-8")
+        return await self._decode_session_text(request, blob)
 
     def _get_session_data(self, session: Session) -> SessionData:
         if session.empty:
@@ -305,6 +533,10 @@ class SimpleCookieStorage(AbstractStorage):
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
         decoder: Callable[[str], Any] = json.loads,
+        max_blob_size: int | None = None,
+        max_session_depth: int | None = None,
+        max_session_containers: int | None = None,
+        on_limit_exceeded: LimitExceededHandler = default_limit_exceeded_handler,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -316,6 +548,10 @@ class SimpleCookieStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            max_blob_size=max_blob_size,
+            max_session_depth=max_session_depth,
+            max_session_containers=max_session_containers,
+            on_limit_exceeded=on_limit_exceeded,
         )
 
     async def load_session(self, request: web.Request) -> Session:
@@ -323,8 +559,7 @@ class SimpleCookieStorage(AbstractStorage):
         if cookie is None:
             return Session(None, data=None, new=True, max_age=self.max_age)
 
-        data = self._decoder(cookie)
-        return Session(None, data=data, new=False, max_age=self.max_age)
+        return await self._load_decoded_session(request, cookie)
 
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session

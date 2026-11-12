@@ -9,7 +9,12 @@ import nacl.utils
 from aiohttp import web
 from nacl.encoding import Base64Encoder
 
-from . import AbstractStorage, Session
+from . import (
+    AbstractStorage,
+    LimitExceededHandler,
+    Session,
+    default_limit_exceeded_handler,
+)
 from .log import log
 
 
@@ -28,7 +33,11 @@ class NaClCookieStorage(AbstractStorage):
         httponly: bool = True,
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
-        decoder: Callable[[str], Any] = json.loads
+        decoder: Callable[[str], Any] = json.loads,
+        max_blob_size: int | None = None,
+        max_session_depth: int | None = None,
+        max_session_containers: int | None = None,
+        on_limit_exceeded: LimitExceededHandler = default_limit_exceeded_handler,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -40,6 +49,10 @@ class NaClCookieStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            max_blob_size=max_blob_size,
+            max_session_depth=max_session_depth,
+            max_session_containers=max_session_containers,
+            on_limit_exceeded=on_limit_exceeded,
         )
 
         self._secretbox = nacl.secret.SecretBox(secret_key)
@@ -51,19 +64,22 @@ class NaClCookieStorage(AbstractStorage):
         cookie = self.load_cookie(request)
         if cookie is None:
             return self.empty_session()
-        else:
-            try:
-                data = self._decoder(
-                    self._secretbox.decrypt(
-                        cookie.encode("utf-8"), encoder=Base64Encoder
-                    ).decode("utf-8")
-                )
-                return Session(None, data=data, new=False, max_age=self.max_age)
-            except (binascii.Error, nacl.exceptions.CryptoError):
-                log.warning(
-                    "Cannot decrypt cookie value, " "create a new fresh session"
-                )
-                return self.empty_session()
+
+        rejected = await self._reject_oversized_blob(request, cookie)
+        if rejected is not None:
+            return rejected
+
+        try:
+            plaintext = self._secretbox.decrypt(
+                cookie.encode("utf-8"), encoder=Base64Encoder
+            ).decode("utf-8")
+        except (binascii.Error, nacl.exceptions.CryptoError):
+            log.warning(
+                "Cannot decrypt cookie value, " "create a new fresh session"
+            )
+            return self.empty_session()
+
+        return await self._decode_session_text(request, plaintext)
 
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session
