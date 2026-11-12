@@ -297,6 +297,186 @@ To use the storage you should push it into
    constructor.
 
 
+.. _aiohttp-session-challenge:
+
+One-time session challenges
+===========================
+
+``aiohttp_session.challenge`` is an optional module for sensitive
+operations guarded by a one-time confirmation challenge.  The challenge
+identifier lives in the session as an ordinary key; the authoritative
+one-time state lives in a separate challenge store so that concurrent
+requests cannot both consume it and so that a failed session save
+cannot make a consumed challenge available again.
+
+.. code-block:: python
+
+   from aiohttp_session import get_session
+   from aiohttp_session.challenge import (
+       MemoryChallengeStore,
+       RetryPolicy,
+       run_session_challenge,
+   )
+
+   challenge_store = MemoryChallengeStore()
+
+   async def confirm(request):
+       session = await get_session(request)
+       result = await run_session_challenge(
+           session,
+           challenge_store,
+           "confirm_challenge",
+           claimant=request["user_id"],
+           operation=perform_sensitive_operation,
+           retry_policy=RetryPolicy.NEVER,
+       )
+       if not result.authorized:
+           raise web.HTTPConflict(text="challenge is not available")
+       return web.Response(text="confirmed")
+
+The challenge identifier is issued and stored under a normal session key,
+for example::
+
+   challenge_id = await issue_session_challenge(
+       session, challenge_store, "confirm_challenge", ttl=300
+   )
+
+No other session key changes behaviour.  Existing session storages
+continue to work unchanged; applications that do not need one-time
+challenge semantics do not need this module.
+
+State transitions are::
+
+   AVAILABLE --claim--> CLAIMED --complete(succeeded)--> COMPLETED
+                                 |
+                                 +--complete(failed)--> FAILED
+                                                    or RETRYABLE
+
+``COMPLETED`` and ``FAILED`` are terminal.  The retry policy is fixed
+on the first successful claim.  ``RetryPolicy.NEVER`` makes an
+operation failure terminal for every request.  With
+``RetryPolicy.SAME_CLAIMANT`` a failure makes the challenge
+``RETRYABLE`` for the original claimant only; it is never restored to
+``AVAILABLE`` and another request cannot use it.  A later request
+cannot loosen the policy chosen by the first claim.
+
+Completion must be recorded before the session is saved.  If the
+session save fails after a completion, the challenge remains
+``COMPLETED`` or ``FAILED``; a stale session value that still contains
+the identifier is denied by the store.
+
+.. class:: MemoryChallengeStore(*, clock=None, token_factory=None)
+
+   In-memory implementation for a single process.  Transitions are
+   serialized with a thread lock, so they are atomic for coroutines in
+   one event loop and for threads in one process.  It does not
+   coordinate separate processes or hosts.  Multi-process deployments
+   must provide their own :class:`AbstractChallengeStore` backed by an
+   atomic shared primitive such as a Redis Lua script or a
+   compare-and-set database operation.
+
+   Pass one instance to every request; a new store per request would
+   defeat the one-time guarantee.  Discarded identifiers remain
+   reserved as tombstones for the lifetime of the store.
+
+.. class:: AbstractChallengeStore
+
+   Optional storage contract for challenge state.  Implementations must
+   make claim and completion atomic compare-and-set operations.
+   Loading a record, checking it in application code, and saving it
+   back is not a valid implementation.
+
+   .. method:: issue_challenge(challenge_id, *, ttl=None)
+
+      Create an AVAILABLE challenge.  Return ``True`` on success.
+      Never reset an existing challenge, whatever its state.
+
+   .. method:: claim_challenge(challenge_id, *, claimant, retry_policy=RetryPolicy.NEVER)
+
+      Atomically claim an AVAILABLE challenge for *claimant*.  At most
+      one caller receives a granted result.  The retry policy is
+      recorded by the first successful claim.
+
+   .. method:: complete_challenge(challenge_id, claim_token, *, outcome)
+
+      Record the operation outcome.  A missing or mismatched claim
+      token never changes state.  See :class:`CompletionResult`.
+
+   .. method:: snapshot(challenge_id)
+
+      Return diagnostic state, or ``None`` for an unknown challenge.
+      Do not use a snapshot for authorization decisions.
+
+   .. method:: discard_challenge(challenge_id)
+
+      Remove a challenge during explicit cleanup.  Never use this as
+      failure handling to make a consumed challenge available again.
+
+.. class:: ClaimResult
+
+   Result of a claim.  ``granted`` is true at most once per
+   AVAILABLE challenge (or for a permitted same-claimant retry).
+   ``claim_token`` is present only for a granted claim and must not be
+   exposed to other requests.
+
+.. class:: CompletionResult
+
+   Result of a completion.  ``completed`` says whether the outcome was
+   recorded.  ``state`` is the resulting :class:`ChallengeState`
+   (``COMPLETED``, ``FAILED``, or ``RETRYABLE``).  A denied completion
+   reports a :class:`CompletionDeniedReason` and leaves state unchanged.
+
+.. class:: ChallengeExecution
+
+   Explicit execution result.  ``authorized`` distinguishes a denied
+   claim from an operation that legitimately returned ``None``.
+   ``state`` is the challenge state after completion (``None`` when
+   unauthorized).  Check ``state`` when the application must treat a
+   completion the store refused to record as a hard failure.
+
+.. class:: ChallengeState
+
+   ``AVAILABLE``, ``CLAIMED``, ``RETRYABLE``, ``COMPLETED`` or
+   ``FAILED``.
+
+.. class:: RetryPolicy
+
+   ``NEVER`` (default) or ``SAME_CLAIMANT``.
+
+.. function:: claim_session_challenge(session, store, key, *, claimant, retry_policy=RetryPolicy.NEVER)
+
+   Read the challenge identifier stored under the ordinary session
+   *key* and claim it.  Return a :class:`ChallengeLease`, or ``None``
+   when the key is missing or the claim is denied.  The session mapping
+   is not mutated.
+
+.. function:: complete_session_challenge(lease, session, key, outcome)
+
+   Record the outcome first, then remove the ordinary session key when
+   the challenge is terminal.  A ``RETRYABLE`` challenge keeps the key
+   for the same claimant.  The returned :class:`CompletionResult` makes
+   the final state explicit.
+
+.. function:: run_session_challenge(session, store, key, *, claimant, operation, retry_policy=RetryPolicy.NEVER)
+
+   Claim, run *operation*, and complete.  Return a
+   :class:`ChallengeExecution`; ``authorized`` is false when the claim
+   is denied, without executing *operation*.  If the operation raises,
+   the challenge is marked failed before the exception propagates.
+   A cancellation is not treated as an operation failure.
+
+.. function:: issue_session_challenge(session, store, key, *, challenge_id=None, ttl=None)
+
+   Issue a new challenge and store its identifier under the ordinary
+   session *key*.  Return the identifier, or ``None`` when the key is
+   already occupied or the store rejects it.
+
+.. function:: challenge_expired(result)
+
+   Return whether a denied claim or completion was caused by challenge
+   expiry.
+
+
 .. module:: aiohttp_session.cookie_storage
 .. currentmodule:: aiohttp_session.cookie_storage
 

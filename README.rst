@@ -85,6 +85,34 @@ Available session storages are:
       $ pip install aiohttp_session[aioredis]
 
 
+One-time confirmation challenges
+--------------------------------
+
+Sensitive operations guarded by a one-time confirmation challenge can
+use the optional ``aiohttp_session.challenge`` module.  The challenge
+identifier remains an ordinary session key; the claim/completion state
+is kept in a store so concurrent requests cannot both consume the
+challenge and a failed session save cannot reopen a consumed one::
+
+    from aiohttp_session.challenge import MemoryChallengeStore, run_session_challenge
+
+    store = MemoryChallengeStore()
+
+    async def confirm(request):
+        session = await get_session(request)
+        result = await run_session_challenge(
+            session, store, "confirm_challenge",
+            claimant=request["user_id"],
+            operation=perform_sensitive_operation,
+        )
+        if not result.authorized:
+            raise web.HTTPConflict()
+        return web.Response(text="confirmed")
+
+The in-memory store is for a single process; multi-process deployments
+need an ``AbstractChallengeStore`` implementation backed by an atomic
+shared primitive.
+
 Developing
 ----------
 

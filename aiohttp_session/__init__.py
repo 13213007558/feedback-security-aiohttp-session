@@ -331,3 +331,52 @@ class SimpleCookieStorage(AbstractStorage):
     ) -> None:
         cookie_data = self._encoder(self._get_session_data(session))
         self.save_cookie(response, cookie_data, max_age=session.max_age)
+
+
+from .challenge import (  # noqa: E402
+    AbstractChallengeStore,
+    ChallengeExecution,
+    ChallengeLease,
+    ChallengeOutcome,
+    ChallengeSnapshot,
+    ChallengeState,
+    ClaimDeniedReason,
+    ClaimResult,
+    CompletionDeniedReason,
+    CompletionResult,
+    MemoryChallengeStore,
+    RetryPolicy,
+    challenge_expired,
+    claim_session_challenge,
+    complete_session_challenge,
+    issue_session_challenge,
+    run_session_challenge,
+)
+
+__all__ = [
+    "AbstractChallengeStore",
+    "AbstractStorage",
+    "ChallengeExecution",
+    "ChallengeLease",
+    "ChallengeOutcome",
+    "ChallengeSnapshot",
+    "ChallengeState",
+    "ClaimDeniedReason",
+    "ClaimResult",
+    "CompletionDeniedReason",
+    "CompletionResult",
+    "MemoryChallengeStore",
+    "RetryPolicy",
+    "Session",
+    "SessionData",
+    "SimpleCookieStorage",
+    "challenge_expired",
+    "claim_session_challenge",
+    "complete_session_challenge",
+    "get_session",
+    "issue_session_challenge",
+    "new_session",
+    "run_session_challenge",
+    "session_middleware",
+    "setup",
+]
