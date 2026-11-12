@@ -71,6 +71,103 @@ Public functions
    .. seealso:: :ref:`aiohttp-session-storage`
 
 
+.. _aiohttp-session-commit-semantics:
+
+Save failures and commit semantics
+==================================
+
+A changed session is saved by the middleware after the handler returns.
+The save goes through three observable stages, reported by
+:class:`CommitStage`:
+
+1. :pyattr:`CommitStage.NOT_SAVED` -- the change exists only in the
+   in-memory :class:`Session`; the storage backend was never reached or
+   refused the write. Nothing durable happened, so the request is safe to
+   retry.
+
+2. :pyattr:`CommitStage.PERSISTED` -- the backend committed the change (a
+   Redis/Memcached record exists, or the cookie payload was produced) but
+   the response could not be updated with the matching cookie. The
+   server-side identity already exists, so non-idempotent login side
+   effects (audit entries, welcome e-mails, ...) must not run again.
+
+3. :pyattr:`CommitStage.COMMITTED` -- the response was already prepared
+   (headers sent, e.g. a streaming response) and cannot carry a session
+   cookie at all. The request cannot be repaired.
+
+Every failure inherits from :class:`SessionError`, which itself is a
+:class:`RuntimeError` (so existing ``except RuntimeError`` code keeps
+working). Inspect :attr:`SessionError.stage`,
+:attr:`SessionError.retryable`, :attr:`SessionError.persisted` and
+:attr:`SessionError.response_mutable` instead of catching every failure
+as a generic save error.
+
+.. class:: CommitStage
+
+   Enumeration of how far a session change got through the save
+   pipeline. Members: ``NOT_SAVED``, ``PERSISTED``, ``COMMITTED``.
+
+.. class:: SessionError(message=None)
+
+   Base class of every session failure. Attributes:
+
+   * ``stage`` -- the :class:`CommitStage` reached when it failed;
+   * ``retryable`` -- ``True`` while nothing durable was committed;
+   * ``persisted`` -- ``True`` once the backend accepted the change;
+   * ``response_mutable`` -- ``True`` while the response may still carry
+     the session cookie.
+
+.. class:: SessionNotSavedError(message=None)
+
+   The change never reached the storage backend. ``stage`` is
+   ``NOT_SAVED`` and ``retryable`` is ``True``.
+
+.. class:: SessionPersistedError(message=None, *, identity=None)
+
+   The backend stored the change but the response could not be updated.
+   ``stage`` is ``PERSISTED`` and ``retryable`` is ``False``. The
+   optional *identity* is the storage key that was committed, suitable
+   as an idempotency key for post-login side effects.
+
+.. class:: SessionResponseLockedError(message=None)
+
+   The response was already prepared and cannot carry a cookie. ``stage``
+   is ``COMMITTED``, ``retryable`` is ``False`` and
+   ``response_mutable`` is ``False``.
+
+A typical application installs an outer middleware that maps the typed
+errors to distinct responses and keeps login side effects idempotent via
+the session identity. A complete, runnable version lives in
+``examples/commit_semantics_login.py``; the skeleton is::
+
+   from aiohttp import web
+   from aiohttp_session import (
+       session_middleware, SessionNotSavedError,
+       SessionPersistedError, SessionResponseLockedError,
+   )
+
+   @web.middleware
+   async def session_error_middleware(request, handler):
+       try:
+           return await handler(request)
+       except SessionNotSavedError:
+           # nothing was written: the client may simply retry
+           raise web.HTTPServiceUnavailable(text="retry the login")
+       except SessionPersistedError as exc:
+           # identity already stored: do NOT re-run login effects,
+           # ask for a fresh request instead
+           mark_effects_done(exc.identity)
+           raise web.HTTPConflict(text="session saved, sign in again")
+       except SessionResponseLockedError:
+           # headers already sent: only logging can help
+           raise web.HTTPInternalServerError()
+
+   app = web.Application(middlewares=[
+       session_error_middleware,
+       session_middleware(storage),
+   ])
+
+
 .. _aiohttp-session-session:
 
 Session
@@ -255,6 +352,18 @@ implement both :meth:`~AbstractStorage.load_session` and
       machinery for storing *session* (:class:`Session`) instance for
       given *request* (:class:`aiohttp.web.Request`) using *response*
       (:class:`aiohttp.web.StreamResponse` or descendants).
+
+      Implementations follow a two-phase commit order and classify
+      failures with the :ref:`typed session errors
+      <aiohttp-session-commit-semantics>`: persist to the backend first,
+      then mutate *response*; raise
+      :class:`~aiohttp_session.SessionNotSavedError` when the backend
+      commit failed and :class:`~aiohttp_session.SessionPersistedError`
+      when it succeeded but the cookie could not be attached. The
+      middleware raises
+      :class:`~aiohttp_session.SessionResponseLockedError` itself when
+      *response* is already prepared, and wraps any unclassified
+      exception as :class:`~aiohttp_session.SessionNotSavedError`.
 
    .. method:: load_cookie(request)
 

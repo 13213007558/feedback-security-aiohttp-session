@@ -8,6 +8,7 @@ import aiomcache
 from aiohttp import web
 
 from . import AbstractStorage, Session
+from .exceptions import SessionNotSavedError, SessionPersistedError
 
 
 class MemcachedStorage(AbstractStorage):
@@ -65,14 +66,9 @@ class MemcachedStorage(AbstractStorage):
         key = session.identity
         if key is None:
             key = self._key_factory()
-            self.save_cookie(response, key, max_age=session.max_age)
-        else:
-            if session.empty:
-                self.save_cookie(response, "", max_age=session.max_age)
-            else:
-                key = str(key)
-                self.save_cookie(response, key, max_age=session.max_age)
 
+        # Phase 1: write the record to Memcached first. A failure here leaves
+        # no durable state, so the request remains retryable.
         data = self._encoder(self._get_session_data(session))
         max_age = session.max_age
         # https://github.com/memcached/memcached/wiki/Programming#expiration
@@ -87,4 +83,28 @@ class MemcachedStorage(AbstractStorage):
         else:
             expire = max_age
         stored_key = (self.cookie_name + "_" + key).encode("utf-8")
-        await self.conn.set(stored_key, data.encode("utf-8"), exptime=expire)
+        try:
+            await self.conn.set(stored_key, data.encode("utf-8"), exptime=expire)
+        except Exception as exc:
+            raise SessionNotSavedError(
+                f"Memcached refused the session write for key {stored_key!r}: "
+                f"{exc!r}"
+            ) from exc
+
+        # Phase 2: the record is stored; point the client at it via the
+        # cookie. Failures here cannot roll the backend write back.
+        try:
+            if session.identity is None:
+                self.save_cookie(response, key, max_age=session.max_age)
+            elif session.empty:
+                self.save_cookie(response, "", max_age=session.max_age)
+            else:
+                self.save_cookie(response, str(key), max_age=session.max_age)
+        except SessionPersistedError:
+            raise
+        except Exception as exc:
+            raise SessionPersistedError(
+                f"Session {key!r} was stored in Memcached but the cookie "
+                f"could not be attached to the response: {exc!r}",
+                identity=key,
+            ) from exc

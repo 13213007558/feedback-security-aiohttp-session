@@ -11,6 +11,32 @@ from typing import Any, TypedDict, cast
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
 
+from .exceptions import (
+    CommitStage,
+    SessionError,
+    SessionNotSavedError,
+    SessionPersistedError,
+    SessionResponseLockedError,
+)
+
+__all__ = [
+    "SESSION_KEY",
+    "STORAGE_KEY",
+    "AbstractStorage",
+    "CommitStage",
+    "Session",
+    "SessionData",
+    "SessionError",
+    "SessionNotSavedError",
+    "SessionPersistedError",
+    "SessionResponseLockedError",
+    "SimpleCookieStorage",
+    "get_session",
+    "new_session",
+    "session_middleware",
+    "setup",
+]
+
 
 class _CookieParams(TypedDict, total=False):
     domain: str | None
@@ -188,17 +214,55 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
         if not isinstance(response, (web.Response, web.HTTPException)):
             # likely got websocket or streaming
             return response
-        if response.prepared:
-            raise RuntimeError("Cannot save session data into prepared response")
         session = request.get(SESSION_KEY)
-        if session is not None:
-            if session._changed:
-                await storage.save_session(request, response, session)
+        if session is not None and session._changed:
+            await _commit_session(storage, request, response, session)
         if raise_response:
             raise cast(web.HTTPException, response)
         return response
 
     return factory
+
+
+async def _commit_session(
+    storage: "AbstractStorage",
+    request: web.Request,
+    response: web.StreamResponse | web.HTTPException,
+    session: Session,
+) -> None:
+    """Persist a changed session, reporting the stage on failure.
+
+    The two failure boundaries map to the commit contract documented on
+    :class:`AbstractStorage.save_session`:
+
+    * a response that is already prepared can never be touched, so the
+      failure is reported as :class:`SessionResponseLockedError` before any
+      storage call happens;
+    * whatever the storage raises is either its own typed
+      :class:`SessionError` or an unexpected backend error, which is treated
+      as "never saved" because the storage gave no persistence guarantee.
+    """
+    if response.prepared:
+        raise SessionResponseLockedError(
+            "Cannot save session data into a prepared response: headers "
+            "have already been sent and the session cookie cannot be "
+            "attached"
+        )
+    try:
+        await storage.save_session(request, response, session)
+    except SessionError:
+        # Typed storage errors already carry the correct stage, e.g. a
+        # backend that persisted the record but failed while writing the
+        # cookie raises SessionPersistedError.
+        raise
+    except Exception as exc:
+        # An unclassified backend error gives no guarantee that anything was
+        # written, so the safest classification is "nothing saved" and the
+        # request remains retryable.
+        raise SessionNotSavedError(
+            f"Storage {type(storage).__name__} failed before the session "
+            f"change was saved: {exc!r}"
+        ) from exc
 
 
 def setup(app: web.Application, storage: "AbstractStorage") -> None:
@@ -263,6 +327,30 @@ class AbstractStorage(metaclass=abc.ABCMeta):
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session
     ) -> None:
+        """Persist *session* and attach its cookie to *response*.
+
+        Implementations follow a two-phase commit order so that callers can
+        tell how far the change got when something fails:
+
+        1. Commit to the storage backend first (Redis/Memcached write,
+           cookie payload encryption, ...).
+        2. Only mutate *response* (set/delete the cookie) once the backend
+           commit has succeeded.
+
+        Failure classification:
+
+        * Raise :class:`SessionNotSavedError` (or let an arbitrary backend
+          exception propagate -- the middleware wraps it) when the backend
+          commit fails and nothing durable was written. The request stays
+          retryable.
+        * Raise :class:`SessionPersistedError` when the backend commit
+          succeeded but attaching the cookie to *response* failed. The
+          identity already exists server-side, so callers must not re-run
+          non-idempotent side effects.
+        * Do not touch a prepared response: the middleware checks
+          ``response.prepared`` before calling this method and raises
+          :class:`SessionResponseLockedError` on the caller's behalf.
+        """
         pass
 
     def load_cookie(self, request: web.Request) -> str | None:

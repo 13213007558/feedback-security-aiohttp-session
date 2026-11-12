@@ -6,6 +6,7 @@ from typing import Any
 from aiohttp import web
 
 from . import AbstractStorage, Session
+from .exceptions import SessionNotSavedError, SessionPersistedError
 
 try:
     from redis import VERSION as REDIS_VERSION, asyncio as aioredis
@@ -86,17 +87,37 @@ class RedisStorage(AbstractStorage):
         key = session.identity
         if key is None:
             key = self._key_factory()
-            self.save_cookie(response, key, max_age=session.max_age)
-        else:
-            if session.empty:
+
+        # Phase 1: commit the data to Redis before touching the response.
+        # A failure here means nothing durable exists, so the request is
+        # still retryable.
+        data_str = self._encoder(self._get_session_data(session))
+        try:
+            await self._redis.set(
+                self.cookie_name + "_" + key,
+                data_str,
+                ex=session.max_age,
+            )
+        except Exception as exc:
+            raise SessionNotSavedError(
+                f"Redis refused the session write for key {key!r}: {exc!r}"
+            ) from exc
+
+        # Phase 2: the record now exists server-side; attach the cookie that
+        # points the client at it. A failure here cannot undo the Redis
+        # write, hence SessionPersistedError.
+        try:
+            if session.identity is None:
+                self.save_cookie(response, key, max_age=session.max_age)
+            elif session.empty:
                 self.save_cookie(response, "", max_age=session.max_age)
             else:
-                key = str(key)
-                self.save_cookie(response, key, max_age=session.max_age)
-
-        data_str = self._encoder(self._get_session_data(session))
-        await self._redis.set(
-            self.cookie_name + "_" + key,
-            data_str,
-            ex=session.max_age,
-        )
+                self.save_cookie(response, str(key), max_age=session.max_age)
+        except SessionPersistedError:
+            raise
+        except Exception as exc:
+            raise SessionPersistedError(
+                f"Session {key!r} was stored in Redis but the cookie could "
+                f"not be attached to the response: {exc!r}",
+                identity=key,
+            ) from exc
