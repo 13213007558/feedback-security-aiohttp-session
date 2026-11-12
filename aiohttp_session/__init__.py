@@ -3,6 +3,7 @@
 __version__ = "2.12.1"
 
 import abc
+import copy
 import json
 import time
 from collections.abc import Callable, Iterator, MutableMapping
@@ -10,6 +11,23 @@ from typing import Any, TypedDict, cast
 
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
+
+from .conflict import ConflictContract, ConflictError
+
+__all__ = (
+    "Session",
+    "SessionData",
+    "AbstractStorage",
+    "SimpleCookieStorage",
+    "ConflictContract",
+    "ConflictError",
+    "get_session",
+    "new_session",
+    "session_middleware",
+    "setup",
+    "SESSION_KEY",
+    "STORAGE_KEY",
+)
 
 
 class _CookieParams(TypedDict, total=False):
@@ -38,6 +56,7 @@ class Session(MutableMapping[str, Any]):
         data: SessionData | None,
         new: bool,
         max_age: int | None = None,
+        track_changes: bool = False,
     ) -> None:
         self._changed: bool = False
         self._mapping: dict[str, Any] = {}
@@ -57,6 +76,13 @@ class Session(MutableMapping[str, Any]):
 
         if session_data is not None:
             self._mapping.update(session_data)
+
+        # Snapshot of the mapping as loaded from the storage.  Storages
+        # with a conflict contract use it as the base of the three-way
+        # merge performed when a concurrent save is detected.
+        self._snapshot: dict[str, Any] | None = (
+            copy.deepcopy(self._mapping) if track_changes else None
+        )
 
     def __repr__(self) -> str:
         return "<{} [new:{}, changed:{}, created:{}] {!r}>".format(
@@ -208,6 +234,13 @@ def setup(app: web.Application, storage: "AbstractStorage") -> None:
 
 
 class AbstractStorage(metaclass=abc.ABCMeta):
+    #: Whether the storage can guard a read/modify/write cycle with a
+    #: conditional (compare-and-swap) write.  Only storages that can do
+    #: so are able to honor a :class:`ConflictContract`; the others
+    #: refuse it explicitly instead of silently overwriting concurrent
+    #: updates.
+    supports_conditional_writes: bool = False
+
     def __init__(
         self,
         *,
@@ -220,7 +253,15 @@ class AbstractStorage(metaclass=abc.ABCMeta):
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
         decoder: Callable[[str], Any] = json.loads,
+        conflict_contract: ConflictContract | None = None,
     ) -> None:
+        if conflict_contract is not None and not self.supports_conditional_writes:
+            raise RuntimeError(
+                "{} does not support conditional writes and therefore "
+                "cannot honor a conflict contract; refusing to configure "
+                "it instead of silently falling back to last-write-wins "
+                "overwrites".format(type(self).__name__)
+            )
         self._cookie_name = cookie_name
         self._cookie_params = _CookieParams(
             domain=domain,
@@ -233,6 +274,7 @@ class AbstractStorage(metaclass=abc.ABCMeta):
         self._max_age = max_age
         self._encoder = encoder
         self._decoder = decoder
+        self._conflict_contract = conflict_contract
 
     @property
     def cookie_name(self) -> str:
@@ -245,6 +287,10 @@ class AbstractStorage(metaclass=abc.ABCMeta):
     @property
     def cookie_params(self) -> _CookieParams:
         return self._cookie_params
+
+    @property
+    def conflict_contract(self) -> ConflictContract | None:
+        return self._conflict_contract
 
     def _get_session_data(self, session: Session) -> SessionData:
         if session.empty:
@@ -305,6 +351,7 @@ class SimpleCookieStorage(AbstractStorage):
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
         decoder: Callable[[str], Any] = json.loads,
+        conflict_contract: ConflictContract | None = None,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -316,6 +363,7 @@ class SimpleCookieStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            conflict_contract=conflict_contract,
         )
 
     async def load_session(self, request: web.Request) -> Session:

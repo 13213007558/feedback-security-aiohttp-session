@@ -8,6 +8,7 @@ from cryptography import fernet
 from cryptography.fernet import InvalidToken
 
 from . import AbstractStorage, Session
+from .conflict import ConflictContract
 from .log import log
 
 
@@ -26,7 +27,8 @@ class EncryptedCookieStorage(AbstractStorage):
         httponly: bool = True,
         samesite: str | None = None,
         encoder: Callable[[object], str] = json.dumps,
-        decoder: Callable[[str], Any] = json.loads
+        decoder: Callable[[str], Any] = json.loads,
+        conflict_contract: ConflictContract | None = None,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -38,6 +40,7 @@ class EncryptedCookieStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            conflict_contract=conflict_contract,
         )
 
         if isinstance(secret_key, fernet.Fernet):

@@ -6,6 +6,7 @@ from typing import Any
 from aiohttp import web
 
 from . import AbstractStorage, Session
+from .conflict import ConflictContract
 
 try:
     from redis import VERSION as REDIS_VERSION, asyncio as aioredis
@@ -42,6 +43,7 @@ class RedisStorage(AbstractStorage):
         key_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
         encoder: Callable[[object], str] = json.dumps,
         decoder: Callable[[str], Any] = json.loads,
+        conflict_contract: ConflictContract | None = None,
     ) -> None:
         super().__init__(
             cookie_name=cookie_name,
@@ -53,6 +55,7 @@ class RedisStorage(AbstractStorage):
             samesite=samesite,
             encoder=encoder,
             decoder=decoder,
+            conflict_contract=conflict_contract,
         )
         if aioredis is None:
             raise RuntimeError("Please install redis")

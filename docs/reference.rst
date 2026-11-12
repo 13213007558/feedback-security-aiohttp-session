@@ -204,9 +204,21 @@ implement both :meth:`~AbstractStorage.load_session` and
    signature: `def decode(param: str) -> Any: ...`.  Default is
    :func:`json.loads`.
 
+   *conflict_contract* -- optional :class:`ConflictContract` describing
+   how concurrent saves of the same session are merged.  Only storages
+   with conditional (compare-and-swap) writes can honor it; any other
+   storage raises :class:`RuntimeError` instead of silently falling
+   back to last-write-wins overwrites.  Default is ``None``.
+
    .. versionadded:: 2.3
 
       Added *encoder* and *decoder* parameters.
+
+   .. attribute:: supports_conditional_writes
+
+      :class:`bool`, ``True`` if the storage guards the
+      read/modify/write cycle of a save with a conditional write and can
+      therefore honor a :class:`ConflictContract`.
 
    .. attribute:: max_age
 
@@ -295,6 +307,86 @@ To use the storage you should push it into
 
    Parameters are the same as for :class:`AbstractStorage`
    constructor.
+
+
+.. module:: aiohttp_session.memory_storage
+.. currentmodule:: aiohttp_session.memory_storage
+
+
+Memory Storage
+--------------
+
+The storage that keeps session data in the process memory and guards
+every save with a conditional (compare-and-swap) write, so a concurrent
+save is always detected instead of silently overwritten.
+
+To use the storage you should push it into
+:func:`~aiohttp_session.session_middleware`::
+
+   app = aiohttp.web.Application(middlewares=[
+       aiohttp_session.memory_storage.MemoryStorage(
+           conflict_contract=aiohttp_session.ConflictContract(
+               permission_fields=frozenset({"permissions"})))])
+
+.. class:: MemoryStorage(*, \
+                         cookie_name="AIOHTTP_SESSION", \
+                         domain=None, max_age=None, path='/', \
+                         secure=None, httponly=True, samesite=None, \
+                         key_factory=lambda: uuid.uuid4().hex, \
+                         encoder=json.dumps, decoder=json.loads, \
+                         conflict_contract=None)
+
+   Create the in-memory storage.
+
+   The class is inherited from :class:`~aiohttp_session.AbstractStorage`
+   and sets :attr:`~aiohttp_session.AbstractStorage.supports_conditional_writes`
+   to ``True``.
+
+   *key_factory* is a callable used to generate a new session key, by
+   default it is ``lambda: uuid.uuid4().hex``.
+
+   When *conflict_contract* is given, a save that loses the race against
+   a concurrent save is re-read, merged according to the contract and
+   retried (up to ``conflict_contract.max_retries``) instead of
+   overwriting the other request's update.  If every attempt conflicts,
+   :class:`~aiohttp_session.ConflictError` is raised.
+
+
+.. currentmodule:: aiohttp_session
+
+
+Conflict handling
+-----------------
+
+Two concurrent requests can load the same session, change different
+parts of it and save in any order.  :class:`ConflictContract` makes the
+merge rules explicit and gives authorization data different semantics
+from ordinary fields:
+
+* *permission fields* (``permission_fields``) are merged recursively
+  against the snapshot taken when the session was loaded, and a
+  deletion made by either request -- at any nesting depth -- always
+  wins.  A late save can never restore a revoked permission.
+* every other field is merged at top-level field granularity: a save
+  only overwrites the fields it actually changed, so non-conflicting
+  updates from concurrent requests are both kept.
+
+.. class:: ConflictContract(*, permission_fields=frozenset(), max_retries=3)
+
+   Immutable description of the merge rules.
+
+   *permission_fields* is a :class:`frozenset` of top-level session
+   keys holding authorization data, merged with deletion-wins
+   semantics.
+
+   *max_retries* is how many times a conflicting save is re-merged and
+   retried before :class:`ConflictError` is raised.
+
+.. exception:: ConflictError
+
+   :class:`RuntimeError` subclass raised when a session save kept
+   losing the conditional-write race and was aborted instead of
+   overwriting concurrent updates.
 
 
 .. module:: aiohttp_session.cookie_storage
