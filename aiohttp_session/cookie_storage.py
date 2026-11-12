@@ -63,7 +63,8 @@ class EncryptedCookieStorage(AbstractStorage):
                 log.warning(
                     "Cannot decrypt cookie value, " "create a new fresh session"
                 )
-                return Session(None, data=None, new=True, max_age=self.max_age)
+                return Session(None, data=None, new=True, max_age=self.max_age,
+                               invalid=True)
 
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session

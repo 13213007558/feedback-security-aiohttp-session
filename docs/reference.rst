@@ -18,6 +18,15 @@ Public functions
    A :ref:`coroutine<coroutine>` for getting session instance from
    request object.
 
+   If the session storage is temporarily unavailable, a degraded
+   temporary anonymous session is returned (its
+   :attr:`Session.unavailable` flag is ``True``) so that public
+   read-only pages keep working.  The degraded session is never
+   persisted, thus the original session is not overwritten once the
+   storage recovers.  Handlers performing protected operations or
+   login state changes should refuse to proceed when
+   :attr:`Session.unavailable` is ``True``.
+
    See example below in :ref:`Session<aiohttp-session-session>`
    section for :func:`get_session` usage.
 
@@ -71,6 +80,22 @@ Public functions
    .. seealso:: :ref:`aiohttp-session-storage`
 
 
+Exceptions
+==========
+
+.. class:: StorageUnavailableError
+
+   Raised by storages when the underlying backend (e.g. Redis or
+   Memcached) is temporarily unreachable.
+
+   The session middleware converts it into a ``503 Service
+   Unavailable`` response with a generic message that never contains
+   connection details.  :func:`get_session` instead degrades to a
+   temporary anonymous session (see :attr:`Session.unavailable`), so
+   public read-only routes remain accessible during an outage while
+   protected operations and login state changes are stopped.
+
+
 .. _aiohttp-session-session:
 
 Session
@@ -114,6 +139,20 @@ Session
 
       A boolean. If new is ``True``, this session is new. Otherwise,
       it has been constituted from data that was already serialized.
+
+   .. attribute:: invalid
+
+      A boolean. If ``True``, the presented credentials (e.g. an
+      undecryptable cookie) could not be validated and a fresh
+      session was created instead.  This is distinguishable from a
+      plainly missing session, where ``invalid`` is ``False``.
+
+   .. attribute:: unavailable
+
+      A boolean. If ``True``, the session is a temporary anonymous
+      one produced while the storage backend was unreachable.  Such
+      sessions are never saved, so the original session stays intact
+      for when the storage recovers.
 
    .. method:: changed()
 

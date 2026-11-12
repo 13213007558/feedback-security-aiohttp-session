@@ -1,5 +1,19 @@
 .. towncrier release notes start
 
+Unreleased
+==========
+
+* Distinguish session load results: added ``Session.invalid`` (credentials
+  could not be validated) and ``Session.unavailable`` (storage backend
+  unreachable), instead of collapsing every case into an empty session.
+
+* Added ``StorageUnavailableError``: Redis/Memcached connection failures are
+  now wrapped in a sanitized exception. The session middleware answers
+  protected operations and login state changes with a generic ``503`` (no
+  connection details leaked), while ``get_session`` degrades to a temporary
+  anonymous session that is never persisted, keeping public read-only pages
+  accessible and leaving the original session untouched for recovery.
+
 2.12.1 (2024-09-25)
 ===================
 

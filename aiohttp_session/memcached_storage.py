@@ -6,8 +6,9 @@ from typing import Any
 
 import aiomcache
 from aiohttp import web
+from aiomcache.exceptions import ClientException
 
-from . import AbstractStorage, Session
+from . import AbstractStorage, Session, StorageUnavailableError
 
 
 class MemcachedStorage(AbstractStorage):
@@ -49,7 +50,10 @@ class MemcachedStorage(AbstractStorage):
         else:
             key = str(cookie)
             stored_key = (self.cookie_name + "_" + key).encode("utf-8")
-            data_b = await self.conn.get(stored_key)
+            try:
+                data_b = await self.conn.get(stored_key)
+            except (OSError, ClientException) as exc:
+                raise StorageUnavailableError(self) from exc
             if data_b is None:
                 return Session(None, data=None, new=True, max_age=self.max_age)
             data = data_b.decode("utf-8")
@@ -57,7 +61,10 @@ class MemcachedStorage(AbstractStorage):
                 sess_data = self._decoder(data)
             except ValueError:
                 sess_data = None
-            return Session(key, data=sess_data, new=False, max_age=self.max_age)
+            return Session(
+                key, data=sess_data, new=False, max_age=self.max_age,
+                invalid=sess_data is None,
+            )
 
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session
@@ -87,4 +94,7 @@ class MemcachedStorage(AbstractStorage):
         else:
             expire = max_age
         stored_key = (self.cookie_name + "_" + key).encode("utf-8")
-        await self.conn.set(stored_key, data.encode("utf-8"), exptime=expire)
+        try:
+            await self.conn.set(stored_key, data.encode("utf-8"), exptime=expire)
+        except (OSError, ClientException) as exc:
+            raise StorageUnavailableError(self) from exc

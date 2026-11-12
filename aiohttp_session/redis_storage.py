@@ -5,7 +5,7 @@ from typing import Any
 
 from aiohttp import web
 
-from . import AbstractStorage, Session
+from . import AbstractStorage, Session, StorageUnavailableError
 
 try:
     from redis import VERSION as REDIS_VERSION, asyncio as aioredis
@@ -70,7 +70,10 @@ class RedisStorage(AbstractStorage):
             return Session(None, data=None, new=True, max_age=self.max_age)
         else:
             key = str(cookie)
-            data_bytes = await self._redis.get(self.cookie_name + "_" + key)
+            try:
+                data_bytes = await self._redis.get(self.cookie_name + "_" + key)
+            except aioredis.RedisError as exc:
+                raise StorageUnavailableError(self) from exc
             if data_bytes is None:
                 return Session(None, data=None, new=True, max_age=self.max_age)
             data_str = data_bytes.decode("utf-8")
@@ -78,7 +81,10 @@ class RedisStorage(AbstractStorage):
                 data = self._decoder(data_str)
             except ValueError:
                 data = None
-            return Session(key, data=data, new=False, max_age=self.max_age)
+            return Session(
+                key, data=data, new=False, max_age=self.max_age,
+                invalid=data is None,
+            )
 
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session
@@ -95,8 +101,11 @@ class RedisStorage(AbstractStorage):
                 self.save_cookie(response, key, max_age=session.max_age)
 
         data_str = self._encoder(self._get_session_data(session))
-        await self._redis.set(
-            self.cookie_name + "_" + key,
-            data_str,
-            ex=session.max_age,
-        )
+        try:
+            await self._redis.set(
+                self.cookie_name + "_" + key,
+                data_str,
+                ex=session.max_age,
+            )
+        except aioredis.RedisError as exc:
+            raise StorageUnavailableError(self) from exc

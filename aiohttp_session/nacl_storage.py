@@ -44,8 +44,9 @@ class NaClCookieStorage(AbstractStorage):
 
         self._secretbox = nacl.secret.SecretBox(secret_key)
 
-    def empty_session(self) -> Session:
-        return Session(None, data=None, new=True, max_age=self.max_age)
+    def empty_session(self, *, invalid: bool = False) -> Session:
+        return Session(None, data=None, new=True, max_age=self.max_age,
+                       invalid=invalid)
 
     async def load_session(self, request: web.Request) -> Session:
         cookie = self.load_cookie(request)
@@ -63,7 +64,7 @@ class NaClCookieStorage(AbstractStorage):
                 log.warning(
                     "Cannot decrypt cookie value, " "create a new fresh session"
                 )
-                return self.empty_session()
+                return self.empty_session(invalid=True)
 
     async def save_session(
         self, request: web.Request, response: web.StreamResponse, session: Session

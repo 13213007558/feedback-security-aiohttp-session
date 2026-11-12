@@ -11,6 +11,22 @@ from typing import Any, TypedDict, cast
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
 
+from .log import log
+
+
+class StorageUnavailableError(Exception):
+    """Session storage backend is temporarily unavailable.
+
+    Raised by storages when the underlying backend (e.g. Redis or
+    Memcached) cannot be reached.  The message is intentionally generic
+    and never contains connection details, so it is safe to expose.
+    """
+
+    def __init__(self, storage: object) -> None:
+        super().__init__(
+            f"Session storage {type(storage).__name__} is temporarily unavailable"
+        )
+
 
 class _CookieParams(TypedDict, total=False):
     domain: str | None
@@ -38,12 +54,16 @@ class Session(MutableMapping[str, Any]):
         data: SessionData | None,
         new: bool,
         max_age: int | None = None,
+        invalid: bool = False,
+        unavailable: bool = False,
     ) -> None:
         self._changed: bool = False
         self._mapping: dict[str, Any] = {}
         self._identity = identity if data != {} else None
         self._new = new if data != {} else True
         self._max_age = max_age
+        self._invalid = invalid
+        self._unavailable = unavailable
         created = data.get("created", None) if data else None
         session_data = data.get("session", None) if data else None
         now = int(time.time())
@@ -90,6 +110,21 @@ class Session(MutableMapping[str, Any]):
     @max_age.setter
     def max_age(self, value: int | None) -> None:
         self._max_age = value
+
+    @property
+    def invalid(self) -> bool:
+        """True if the presented credentials could not be validated."""
+        return self._invalid
+
+    @property
+    def unavailable(self) -> bool:
+        """True if the session is a temporary anonymous one.
+
+        Such sessions are produced while the storage backend is
+        unreachable and are never persisted, so the original session
+        is left intact for when the storage recovers.
+        """
+        return self._unavailable
 
     def changed(self) -> None:
         self._changed = True
@@ -140,7 +175,20 @@ async def get_session(request: web.Request) -> Session:
                 "Install aiohttp_session middleware " "in your aiohttp.web.Application"
             )
 
-        session = await storage.load_session(request)
+        try:
+            session = await storage.load_session(request)
+        except StorageUnavailableError:
+            # Degrade to a temporary anonymous session so that public
+            # pages keep working while the storage is down.  The
+            # degraded session is never saved, thus the original
+            # session is not overwritten once the storage recovers.
+            log.warning(
+                "Session storage is unavailable, "
+                "using a temporary anonymous session"
+            )
+            session = Session(
+                None, data=None, new=True, max_age=storage.max_age, unavailable=True
+            )
         if not isinstance(session, Session):
             raise RuntimeError(
                 "Installed {!r} storage should return session instance "
@@ -183,6 +231,13 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
         except web.HTTPException as exc:
             response = exc
             raise_response = True
+        except StorageUnavailableError as exc:
+            # Protected operations and login state changes must stop
+            # while the storage is down.  Respond with a generic 503
+            # that does not leak any connection details.
+            log.warning("Session storage is unavailable: %s", exc)
+            response = web.HTTPServiceUnavailable(text=str(exc))
+            raise_response = True
         if not isinstance(response, (web.StreamResponse, web.HTTPException)):
             raise RuntimeError(f"Expect response, not {type(response)!r}")
         if not isinstance(response, (web.Response, web.HTTPException)):
@@ -192,8 +247,12 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
             raise RuntimeError("Cannot save session data into prepared response")
         session = request.get(SESSION_KEY)
         if session is not None:
-            if session._changed:
-                await storage.save_session(request, response, session)
+            if session._changed and not session.unavailable:
+                try:
+                    await storage.save_session(request, response, session)
+                except StorageUnavailableError as exc:
+                    log.warning("Cannot save session, storage unavailable: %s", exc)
+                    raise web.HTTPServiceUnavailable(text=str(exc)) from None
         if raise_response:
             raise cast(web.HTTPException, response)
         return response
@@ -323,7 +382,12 @@ class SimpleCookieStorage(AbstractStorage):
         if cookie is None:
             return Session(None, data=None, new=True, max_age=self.max_age)
 
-        data = self._decoder(cookie)
+        try:
+            data = self._decoder(cookie)
+        except ValueError:
+            log.warning("Cannot decode cookie value, create a new fresh session")
+            return Session(None, data=None, new=True, max_age=self.max_age,
+                           invalid=True)
         return Session(None, data=data, new=False, max_age=self.max_age)
 
     async def save_session(
